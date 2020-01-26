@@ -23,21 +23,22 @@ Repository for TPU Experiment
     :
 ```
 
-2. Start VM and TPU
+2. Create VM and TPU
 
 - Create VM which has many cpu cores by UI or CLI. (ex: n1-highmem-96)
-    - Many cpus are important for only Pytorch
+    - Many cpus are important for only Pytorch.
 
-- Create TPU by UI or CLI at same zone where VM is started
+- Create TPU by UI or CLI at same zone where VM is created.
+
 
 ```
-$ ctpu up --tpu-size=v3-8 --name=resnet-tutorial --preemptible --zone='us-central1-a'
+$ ctpu up --tpu-size=v3-8 --name=resnet-tutorial --preemptible --zone='us-central1-a' --tf-version=pytorch-nightly
 ```
 
 3. Pull docker image
 
 ```
-$ dokcer pull gcr.io/tpu-pytorch/xla:r0.5
+$ dokcer pull gcr.io/tpu-pytorch/xla:nightly
 ```
 
 4. Set TPU_IP_ADDRESS (TPU internal IP Address)
@@ -59,7 +60,7 @@ $ docker run --rm -it --shm-size 126G \
     -v $PWD/reports:/reports \
     -v ~/.config/gcloud:/root/.config/gcloud \
     --ipc=host \
-    gcr.io/tpu-pytorch/xla:r0.5 \
+    gcr.io/tpu-pytorch/xla:nightly \
     python /pytorch/xla/test/test_train_mp_imagenet.py --model resnet50 --datadir /imagenet_data/ --num_worker 24 --num_cores 8 --logdir ./reports --log_steps 200
 ```
 
@@ -74,7 +75,7 @@ $ docker run --rm -it --shm-size 126G \
     -v $PWD/reports:/reports \
     -v ~/.config/gcloud:/root/.config/gcloud \
     --ipc=host \
-    gcr.io/tpu-pytorch/xla:r0.5 \
+    gcr.io/tpu-pytorch/xla:nightly \
     python /pytorch/xla/test/test_train_imagenet.py --model resnet50 --datadir /imagenet_data/ --num_worker 24 --num_cores 8 --logdir ./reports --log_steps 200
 ```
 
