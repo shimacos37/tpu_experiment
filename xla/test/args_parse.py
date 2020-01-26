@@ -31,6 +31,7 @@ def parse_common_options(
     parser.add_argument("--drop_last", action="store_true")
     parser.add_argument("--fake_data", action="store_true")
     parser.add_argument("--tidy", action="store_true")
+    parser.add_argument("--warm_start", action="store_true")
     parser.add_argument("--metrics_debug", action="store_true")
     if opts:
         for name, aopts in opts:

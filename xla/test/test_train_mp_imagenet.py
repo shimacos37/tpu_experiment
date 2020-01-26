@@ -43,26 +43,27 @@ FLAGS = args_parse.parse_common_options(
 )
 
 import os
-import sys
+import time
 import schedulers
+from statistics import mean
+import test_utils
 import warnings
 
 warnings.filterwarnings("ignore", category=FutureWarning)
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from tensorboardX import SummaryWriter
 import torchvision
 import torchvision.transforms as transforms
 import torch_xla
 import torch_xla.debug.metrics as met
+import torch_xla.distributed.data_parallel as dp
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.utils.utils as xu
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
-import test_utils
-from torch.utils.tensorboard import SummaryWriter
 
 DEFAULT_KWARGS = dict(
     batch_size=128,
@@ -103,12 +104,6 @@ MODEL_PROPERTIES = {
 
 def get_model_property(key):
     return MODEL_PROPERTIES.get(FLAGS.model, MODEL_PROPERTIES["DEFAULT"])[key]
-
-
-def _train_update(device, x, loss, tracker):
-    test_utils.print_training_update(
-        device, x, loss.item(), tracker.rate(), tracker.global_rate()
-    )
 
 
 def train_imagenet():
@@ -174,14 +169,12 @@ def train_imagenet():
             train_dataset,
             batch_size=FLAGS.batch_size,
             sampler=train_sampler,
-            drop_last=FLAGS.drop_last,
             shuffle=False if train_sampler else True,
             num_workers=FLAGS.num_workers,
         )
         test_loader = torch.utils.data.DataLoader(
             test_dataset,
             batch_size=FLAGS.test_set_batch_size,
-            drop_last=FLAGS.drop_last,
             shuffle=False,
             num_workers=FLAGS.num_workers,
         )
@@ -189,10 +182,10 @@ def train_imagenet():
     torch.manual_seed(42)
 
     device = xm.xla_device()
-    model = get_model_property("model_fn")().to(device)
+    model = get_model_property("model_fn")()
     writer = None
-    if xm.is_master_ordinal():
-        writer = SummaryWriter(FLAGS.logdir)
+    if FLAGS.logdir and xm.is_master_ordinal():
+        writer = SummaryWriter(log_dir=FLAGS.logdir)
     optimizer = optim.SGD(
         model.parameters(), lr=FLAGS.lr, momentum=FLAGS.momentum, weight_decay=1e-4
     )
@@ -209,6 +202,14 @@ def train_imagenet():
         num_steps_per_epoch=num_training_steps_per_epoch,
         summary_writer=writer,
     )
+    start_epoch = 0
+    if FLAGS.warm_start:
+        checkpoint = torch.load(f"./reports/resnet152_model-26.pt")
+        model.load_state_dict(checkpoint["state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        lr_scheduler._step_count = checkpoint["step"]
+        start_epoch = checkpoint["epoch"]
+    model.to(device)
     loss_fn = nn.CrossEntropyLoss()
 
     def train_loop_fn(loader):
@@ -218,7 +219,7 @@ def train_imagenet():
         correct = 0
         top5_accuracys = 0
         losses = 0
-        for x, (data, target) in loader:
+        for x, (data, target) in enumerate(loader):
             optimizer.zero_grad()
             output = model(data)
             loss = loss_fn(output, target)
@@ -226,10 +227,10 @@ def train_imagenet():
             xm.optimizer_step(optimizer)
             tracker.add(FLAGS.batch_size)
             pred = output.max(1, keepdim=True)[1]
-            correct += pred.eq(target.view_as(pred)).sum()
+            correct += pred.eq(target.view_as(pred)).sum().item()
             losses += loss.item()
             total_samples += data.size()[0]
-            top5_accuracys += topk_accuracy(output, target, topk=5)
+            top5_accuracys += topk_accuracy(output, target, topk=5).item()
             if lr_scheduler:
                 lr_scheduler.step()
             if x % FLAGS.log_steps == 0:
@@ -238,8 +239,8 @@ def train_imagenet():
                 )
         return (
             losses / (x + 1),
-            (100.0 * correct / total_samples).item(),
-            (top5_accuracys / (x + 1)).item(),
+            (100.0 * correct / total_samples),
+            (top5_accuracys / (x + 1)),
         )
 
     def test_loop_fn(loader):
@@ -247,7 +248,7 @@ def train_imagenet():
         correct = 0
         top5_accuracys = 0
         model.eval()
-        for x, (data, target) in loader:
+        for x, (data, target) in enumerate(loader):
             output = model(data)
             pred = output.max(1, keepdim=True)[1]
             correct += pred.eq(target.view_as(pred)).sum().item()
@@ -260,53 +261,65 @@ def train_imagenet():
 
     accuracy = 0.0
     max_accuracy = 0.0
-    for epoch in range(1, FLAGS.num_epochs + 1):
-        # Train evaluate
+    start = time.time()
+    for epoch in range(start_epoch, FLAGS.num_epochs + 1):
+        epoch_start = time.time()
         para_loader = pl.ParallelLoader(
             train_loader, [device], loader_prefetch_size=32, device_prefetch_size=8
         )
         loss, accuracy, top5_accuracy = train_loop_fn(
             para_loader.per_device_loader(device)
         )
-        xm.master_print(
-            "Epoch: {} (Train), Loss {}, Mean Top-1 Accuracy: {:.2f} Top-5 accuracy: {}".format(
-                epoch, loss, accuracy, top5_accuracy
+        if xm.is_master_ordinal():
+            print(
+                "Finished training epoch {}, duration_time {} sec, total duration_time {} sec".format(
+                    epoch, time.time() - epoch_start, time.time() - start
+                )
             )
-        )
-        test_utils.add_scalar_to_summary(writer, "Loss/train", loss, epoch)
-        test_utils.add_scalar_to_summary(
-            writer, "Top-1 Accuracy/train", accuracy, epoch
-        )
-        test_utils.add_scalar_to_summary(
-            writer, "Top-5 Accuracy/train", top5_accuracy, epoch
-        )
-        xm.master_print("Finished training epoch {}".format(epoch))
-        # Valid evaluate
+            print(
+                "Epoch: {} (Train), Loss {}, Top-1 Accuracy: {:.2f} Top-5 accuracy: {}".format(
+                    epoch, loss, accuracy, top5_accuracy
+                )
+            )
+            test_utils.add_scalar_to_summary(writer, "Loss/train", loss, epoch)
+            test_utils.add_scalar_to_summary(
+                writer, "Top-1 Accuracy/train", accuracy, epoch
+            )
+            test_utils.add_scalar_to_summary(
+                writer, "Top-5 Accuracy/train", top5_accuracy, epoch
+            )
         para_loader = pl.ParallelLoader(test_loader, [device])
         accuracy, top5_accuracy = test_loop_fn(para_loader.per_device_loader(device))
-        xm.master_print(
-            "Epoch: {}, Mean Top-1 Accuracy: {:.2f} Top-5 accuracy: {}".format(
-                epoch, accuracy, top5_accuracy
+        if xm.is_master_ordinal():
+            print(
+                "Epoch: {} (Valid), Top-1 Accuracy: {:.2f} Top-5 accuracy: {}".format(
+                    epoch, accuracy, top5_accuracy
+                )
             )
-        )
-        test_utils.add_scalar_to_summary(writer, "Top-1 Accuracy/test", accuracy, epoch)
-        test_utils.add_scalar_to_summary(
-            writer, "Top-5 Accuracy/test", top5_accuracy, epoch
-        )
+            test_utils.add_scalar_to_summary(
+                writer, "Top-1 Accuracy/test", accuracy, epoch
+            )
+            test_utils.add_scalar_to_summary(
+                writer, "Top-5 Accuracy/test", top5_accuracy, epoch
+            )
         if FLAGS.metrics_debug:
             print(met.metrics_report())
         if accuracy > max_accuracy:
             max_accuracy = max(accuracy, max_accuracy)
-            torch.save(
-                model.to("cpu").state_dict(), f"./reports/resnet50_model-{epoch}.pt"
+            xm.save(
+                {
+                    "epoch": epoch,
+                    "step": lr_scheduler._step_count,
+                    "state_dict": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                },
+                f"./reports/{FLAGS.model}_model-{epoch}.pt",
+                master_only=True,
             )
-            model.to(device)
             if writer is not None:
                 writer.flush()
 
-    test_utils.close_summary_writer(writer)
-    xm.master_print("Max Accuracy: {:.2f}%".format(accuracy))
-    return max_accuracy
+    return accuracy
 
 
 def topk_accuracy(output, target, topk=5):
@@ -330,7 +343,6 @@ def _mp_fn(index, flags):
     accuracy = train_imagenet()
     if accuracy < FLAGS.target_accuracy:
         print("Accuracy {} is below target {}".format(accuracy, FLAGS.target_accuracy))
-        sys.exit(21)
 
 
 if __name__ == "__main__":
